@@ -1,0 +1,1393 @@
+---
+title: "Analisi di Rete del Pendolarismo tra Comuni Italiani (2021)"
+author: "Jessica Tavano"
+date: "`r Sys.Date()`"
+format:
+  revealjs:
+    theme: serif
+    transition: slide
+    slide-number: true
+    progress: true
+    scrollable: true
+    css: style.css
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache=TRUE, echo = TRUE, eval = TRUE, message=F, warning = F, fig.align='center')
+
+if (!require("knitr")) install.packages("knitr")
+if (!require("readxl")) install.packages("readxl")
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("readr")) install.packages("readr")
+if (!require("tidyr")) install.packages("tidyr")
+if (!require("igraph")) install.packages("igraph")
+if (!require("ggraph")) install.packages("ggraph")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("stringr")) install.packages("stringr")
+if (!require("kableExtra")) install.packages("kableExtra")
+if (!require("sf")) install.packages("sf")
+if (!require("geodata")) install.packages("geodata")
+if (!require("patchwork")) install.packages("patchwork")
+if (!require("ggrepel")) install.packages("ggrepel")
+if (!require("ragg")) install.packages("ragg")
+
+library(readxl)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+library(tidygraph)
+library(stringr)
+library(kableExtra)
+library(sf)
+library(geodata)
+library(patchwork)
+library(ggrepel)
+library(ragg)
+
+```
+
+## Dataset: provenienza
+
+I dati utilizzati provengono dalle banche dati dell'[ISTAT](https://www.istat.it/) (Istituto Nazionale di Statistica) e del [MEF](https://www.finanze.gov.it/it/) (Ministero dell'Economia e delle Finanze - Dipartimento delle Finanze).
+
+Sono stati utilizzati i seguenti dataset:
+
+-   [Comuni](https://www.istat.it/classificazione/codici-dei-comuni-delle-province-e-delle-regioni/): elenco delle unità amministrative comunali italiane valide nel 2021.
+-   [Matrice di pendolarismo per lavoro](https://esploradati.istat.it/databrowser/#/it/censpop/categories/MATRICE_PEND) (2021): descrive gli spostamenti di 19.565.808 individui che, almeno tre giorni a settimana, si recano per motivi lavorativi dal comune di residenza a quello di lavoro.
+-   [Redditi comunali](https://www1.finanze.gov.it/finanze/analisi_stat/public/index.php?opendata=yes): informazioni aggregate a livello comunale sui redditi dichiarati ai fini IRPEF.
+
+```{r estrazione e rinomina datasets, echo=FALSE}
+
+comuni <- read_xlsx("datasets/comuni_italiani_2021.xlsx")
+
+pendolavoro <- read_xlsx("datasets/matrix_pendoLAVORO_2021.xlsx")
+
+reddito <- read_xlsx("datasets/Redditi_e_principali_variabili_IRPEF_su_base_comunale_CSV_2021.xlsx")
+
+comuni <- comuni %>%
+  select(
+    id = PRO_COM, # 1001
+    id_catastale = COD_CATASTO, # A074
+    nome = COMUNE, # Agliè
+    id_provincia = COD_PROV_STORICO, # 001 
+    sigla_provincia = SIGLA_AUTOMOBILISTICA, # TO
+    provincia = DEN_UTS, # Torino
+    regione = DEN_REG, # Piemonte
+    ripartizione = DEN_RIP, # Nord-ovest
+    point_x = POINT_X,
+    point_y = POINT_Y,
+    popolazione = POP21,
+    superficie = SUPERFICIE
+  )
+
+spostamenti <- pendolavoro %>%
+  select(
+    from_prov = Prov_res, # 1
+    from = Procom_res, # 1001
+    to_prov = Prov_lav, # 1
+    to = Procom_lav, # 1015
+    num_pendolari = Pendolari
+  ) %>%
+  filter(num_pendolari > 0)
+
+reddito <- reddito %>%
+  select(
+    id_comune = `Codice Istat Comune`, # 1001
+    id_cat_comune = `Codice catastale`, # A074
+    comune = `Denominazione Comune`, # AGLIE'
+    reddito_lav = `Reddito da lavoro dipendente e assimilati - Ammontare in euro`, # 23674791
+    reddito_tot = `Reddito imponibile - Ammontare in euro`, # 43999670
+    num_contribuenti = `Numero contribuenti` # 1963
+  )
+
+#n_distinct(comuni$id)
+
+```
+
+## Informazioni principali considerate
+
+### **Comuni**
+
+-   `Id`: codice ISTAT del comune.
+-   `Nome`: denominazione del comune.
+-   `Provincia`: denominazione della provincia.
+-   `Regione`: regione di appartenenza.
+-   `Ripartizione`: ripartizione geografica (Nord-Ovest, Nord-Est, Centro, Sud, Isole).
+-   `Popolazione`: popolazione residente nel 2021.
+
+### **Spostamenti**
+
+-   `From`: codice del comune di residenza del pendolare.
+-   `To`: codice del comune di lavoro del pendolare.
+-   `Num_pendolari`: numero di pendolari che si spostano da `From` a `To`.
+
+### **Reddito**
+
+-   `Id_comune`: codice ISTAT del comune.
+-   `Reddito_lav`: ammontare complessivo del reddito da lavoro dipendente e assimilati.
+-   `Reddito_tot`: reddito imponibile complessivo.
+-   `Num_contribuenti`: numero di contribuenti del comune.
+
+## Esempio di `comuni`, `spostamenti` e `reddito`
+
+```{r Esempi dei dati nei dataset, echo=FALSE}
+
+#set.seed(123)  # per riproducibilità
+
+comuni_sample <- comuni %>%
+  filter(popolazione > 2000) %>%
+  select(id, nome, provincia, regione, ripartizione, popolazione) %>%
+  sample_n(7)
+
+comuni_sample %>%
+  kable(
+    col.names = c("Id", "Nome", "Provincia", "Regione", "Ripartizione", 
+                  "Popolazione"),
+    align = "c",
+    format = "html",
+    escape = FALSE
+  ) %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover"),
+    font_size = 18,
+  ) %>%
+  row_spec(0, background = "steelblue", color = "white") %>%
+  add_header_above(c("Comuni" = 6), bold = TRUE, line = TRUE)
+
+spostamenti %>%
+  filter(from %in% comuni_sample$id | to %in% comuni_sample$id) %>%
+  select(from, to, num_pendolari) %>%
+  sample_n(min(7, n())) %>%
+  kable(
+    col.names = c("From", "To", "Num_pendolari"),
+    align = "c",
+    format = "html",
+    escape = FALSE
+  ) %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover"),
+    font_size = 18,
+  ) %>%
+  row_spec(0, background = "steelblue", color = "white") %>%
+  add_header_above(c("Spostamenti" = 3), bold = TRUE, line = TRUE)
+
+reddito %>%
+  filter(id_comune %in% comuni_sample$id) %>%
+  mutate(
+    comune = str_to_title(str_to_lower(comune))
+  ) %>%
+  select(id_comune, comune, reddito_lav, reddito_tot, num_contribuenti) %>%
+  sample_n(7) %>%
+  kable(
+    col.names = c("Id_comune", "Comune", "Reddito_lav", "Reddito_tot", "Num_contribuenti"),
+    align = "c",
+    format = "html",
+    escape = FALSE
+  ) %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover"),
+    font_size = 18,
+  ) %>%
+  row_spec(0, background = "steelblue", color = "white") %>%
+  add_header_above(c("Reddito" = 5), bold = TRUE, line = TRUE)
+
+```
+
+## La Rete
+
+**Alcuni dati**: 
+
+```{r coordinate, echo=FALSE}
+
+# Converte coordinate del centroide (point_x, point_y) in lat e lon (WGS84)
+# - trasformare un dataset in oggetto geometrico (st_as_sf)
+# - cambiare il sistema di riferimento (st_transform)
+# - estrarre coordinate numeriche (st_coordinates)
+# - rimuovere la geometria (st_drop_geometry)
+
+
+converti_coord_comuni <- function(df_comuni,
+                                  crs_input = 25832,
+                                  crs_output = 4326) {
+  # st_as_sf trasforma il df in un oggetto geografico sf, crea la colonna geometry e associa il punto geometrico al crs di input
+  # converte la geometrica dal crs di input al crs di output
+  comuni_sf <- df_comuni %>%
+    st_as_sf(coords = c("point_x", "point_y"), crs = crs_input) %>%
+    st_transform(crs_output)
+  
+  # estrae le coordinate dalla colonna geometry, restituendo una matrice
+  coords <- st_coordinates(comuni_sf)
+  
+  # aggiunge colonne lon e lat e rimuove geometry (st_drop_geometry)
+  comuni_out <- comuni_sf %>%
+    mutate(
+      lon = coords[, 1],
+      lat = coords[, 2]
+    ) %>%
+    st_drop_geometry()
+  
+  return(comuni_out)
+}
+
+comuni <- converti_coord_comuni(comuni)
+
+```
+
+```{r dati finali, echo=FALSE}
+
+# i cumuni sono tutti presenti in spostamenti? e viceversa
+# all(spostamenti$from %in% comuni$id) --> TRUE
+# all(spostamenti$to %in% comuni$id) --> TRUE
+
+g <- graph_from_data_frame(
+  d = spostamenti %>% select(from, to, weight = num_pendolari),
+  vertices = comuni,
+  directed = TRUE
+)
+
+n_nodi <- vcount(g)
+n_archi <- ecount(g)
+
+tot_pendolari <- sum(E(g)$weight)
+
+# Archi intra-comunali (from == to)
+pendolari_interni <- sum(
+  E(g)[ends(g, E(g))[,1] == ends(g, E(g))[,2]]$weight
+)
+
+# Archi inter-comunali
+pendolari_esterni <- tot_pendolari - pendolari_interni
+
+deg_tot <- degree(g, mode = "all")
+
+n_degree_pos <- sum(deg_tot > 0)
+n_isolati <- sum(deg_tot == 0)
+
+# comuni con solo self-loops
+comuni_only_self <- V(g)$name[
+  deg_tot > 0 &           # almeno un flusso
+  degree(g, loops = FALSE) == 0
+]
+
+perc_connessi <- round(n_degree_pos / n_nodi * 100, 2)
+
+# separatore delle migliaia
+fmt <- function(x) formatC(x, format = "f", digits = 0, big.mark = ".", decimal.mark = ",")
+
+n_archi_fmt <- fmt(n_archi)
+tot_pendolari_fmt <- fmt(tot_pendolari)
+pend_intra_fmt <- fmt(pendolari_interni)
+pend_inter_fmt <- fmt(pendolari_esterni)
+
+
+
+```
+
+- **Numero di nodi (comuni)**: `r n_nodi`
+- **Numero di archi (flussi orig–dest)**: `r n_archi_fmt`
+- **Numero totale di pendolari**: `r tot_pendolari_fmt`
+- **Pendolari intra-comunali**: `r pend_intra_fmt`
+- **Pendolari inter-comunali**: `r pend_inter_fmt`
+- **Comuni con almeno una connessione**: `r n_degree_pos` (`r perc_connessi`%)
+- **Comuni con solo flussi intra-comunali (self-loops)**: `r length(comuni_only_self)`
+
+
+## La Cartina Italiana
+
+<div class="zoom-wrap">
+```{r cartina italiana, fig.width=10, fig.height=13, echo=FALSE}
+
+edges_geo <- spostamenti %>%
+  left_join(comuni %>% select(id, lon, lat, nome, regione), by = c("from" = "id")) %>%
+  rename(lon_from = lon, lat_from = lat, nome_from = nome, regione_from = regione) %>%
+  left_join(comuni %>% select(id, lon, lat, nome, regione), by = c("to" = "id")) %>%
+  rename(lon_to = lon, lat_to = lat, nome_to = nome, regione_to = regione)
+
+edges_filt <- edges_geo %>%
+  filter(num_pendolari >= 100)
+
+q <- quantile(edges_geo$num_pendolari, 0.98)  # top 2%
+edges_filt <- edges_geo %>%
+  filter(num_pendolari >= q)
+
+
+# gadm() (pacchetto geodata) scarica i confini amministrativi dal database GADM
+# level = 1: regioni
+# level = 2: province
+
+regioni_sf <- geodata::gadm(country = "ITA", level = 1, path = "datasets") %>%
+  st_as_sf() # converto in formato sf
+
+province_sf <- geodata::gadm(country = "ITA", level = 2, path = "datasets") %>%
+  st_as_sf()
+
+# unique(regioni_sf$NAME_1)
+# unique(comuni$regione)
+print (
+ggplot() +
+#disegno della base geografica
+  geom_sf(data = regioni_sf, fill = "gray95", color = "gray20", linewidth = 0.20) +
+  geom_segment(data = edges_filt,
+                aes(x = lon_from, y = lat_from, xend = lon_to, yend = lat_to),
+                alpha = 0.7,
+                color = "steelblue",
+                linewidth = 0.28) +
+  geom_point(data = comuni, aes(x = lon, y = lat), size = 0.35, alpha = 0.7, color = "black") +
+
+  coord_sf() + # imposta sistema corretto per mappe sf
+  theme_void() +
+  labs(
+    title = "Rete del pendolarismo lavorativo in Italia (2021)",
+    subtitle = "Rete filtrata - top 2%"
+  )
+)
+
+```
+</div>
+
+## Le Regioni
+
+```{r cartine regioni, echo=FALSE}
+
+# funzione che elimina il / dopo il nome della regione
+regione_norm <- function(x) {
+  x %>%
+    trimws() %>%
+    sub("/.*", "", .) # prende solo la parte prima dello slash
+}
+
+
+# PROBLEMA DI MATCHING NOMI DELLE REGIONI (regioni_sf) con i nomi del dataset
+# Correzione_nome_regione: dato un nome in input di una regione restituisce il nome corretto 
+
+correzione_nome_regione <- function(nome_reg, regioni_sf) {
+  
+  nome_reg_norm <- tolower(trimws(regione_norm(nome_reg)))
+  
+  # 1) Match diretto su NAME_1
+  idx_direct <- which(tolower(regioni_sf[["NAME_1"]]) == nome_reg_norm)
+  if (length(idx_direct) == 1) {
+    return(regioni_sf[["NAME_1"]][idx_direct])
+  }
+  
+  # 2) Match su VARNAME_1 separato da |
+  idx_var <- which(
+    sapply(regioni_sf[["VARNAME_1"]], function(x) {
+      if (is.na(x) || x == "") return(FALSE)
+
+      vars <- strsplit(tolower(x), "\\|")[[1]]
+      vars <- trimws(vars)
+
+      nome_reg_norm %in% vars
+    })
+  )
+  
+  if (length(idx_var) == 1) {
+    return(regioni_sf[["NAME_1"]][idx_var])
+  }
+
+  stop(paste0("Nome non trovato (o ambiguo): ", nome_reg))
+}
+
+
+# FUNZIONE PER CREARE UNA RETE CON SOLO FLUSSI INTERNI ALLA REGIONE.
+# aggiunta del PageRank: misura importanza globale della rete.
+
+make_graph_region <- function(nome_reg, soglia) {
+  
+  comuni_reg <- comuni %>%
+    filter(regione == nome_reg)
+
+  # spostamenti interni alla regione
+  spost_reg <- spostamenti %>%
+    filter(
+      from %in% comuni_reg$id,
+      to   %in% comuni_reg$id,
+      num_pendolari > soglia
+    ) %>%
+    select(from, to, weight = num_pendolari)
+
+  # creazione del grafo
+  g_reg <- graph_from_data_frame(
+    d = spost_reg,
+    vertices = comuni_reg %>% select(id, nome, regione, lon, lat),
+    directed = TRUE
+  )
+  
+  # rimuovo nodi isolati
+  g_reg <- delete_vertices(g_reg, V(g_reg)[degree(g_reg) == 0])
+
+  return(g_reg)
+}
+
+
+# FUNZIONE PER DISEGNARE IL GRAFO SU MAPPA
+
+plot_graph_region_map <- function(nome_reg, soglia, top_n) {
+
+  # correggo il nome della regione in input
+  nome_reg_std <- correzione_nome_regione(nome_reg, regioni_sf)
+  
+  reg_sf <- regioni_sf %>% filter(NAME_1 == nome_reg_std)
+  
+  prov_sf <- province_sf %>% filter(NAME_1 == nome_reg_std)
+
+  comuni_reg <- comuni %>% filter(regione == nome_reg_std)
+
+  # CREAZIONE DEL GRAFO
+  g_reg <- make_graph_region(nome_reg, soglia)
+
+  # se dopo il filtro la rete è vuota, mostro solo la regione
+  if (vcount(g_reg) == 0 || ecount(g_reg) == 0) {
+    return(
+      ggplot() +
+        geom_sf(data = reg_sf, fill = "gray95", color = "gray40") +
+        theme_void() +
+        labs(
+          title = paste("Rete pendolarismo -", nome_reg),
+          subtitle = paste("Nessun arco sopra soglia =", soglia)
+        )
+      )
+  }
+
+  pr <- page_rank(g_reg, directed = TRUE, weights = E(g_reg)$weight)$vector
+  V(g_reg)$pr <- pr
+  
+  # TABELLA Top N comuni per PAGERANK
+  top_tbl <- tibble(
+    id = V(g_reg)$name,
+    nome = V(g_reg)$nome,
+    pagerank = V(g_reg)$pr
+  ) %>%
+    arrange(desc(pagerank)) %>%
+    slice_head(n = top_n) %>%
+    mutate(
+      rank = row_number(),
+      pagerank = round(pagerank, 4)
+    )
+
+  p_tab <- ggplot(top_tbl, aes(x = 1, y = rank * 0.5,
+                             label = paste0(rank, ". ", nome, " (", pagerank, ")"))) +
+    geom_text(hjust = 0, size = 3.5) +
+    scale_y_reverse(limits = c(top_n + 0.5, 0.5)) +
+    xlim(1, 1.8) +
+    theme_void() +
+    theme(
+      plot.title = element_text(size = 11, face = "bold", hjust = 0),
+      plot.margin = margin(5, 5, 5, 5)
+      ) +
+    labs(title = paste("Top", top_n, "comuni per PageRank"))
+  
+  # aggiungo rank ai nodi (solo top_n)
+  V(g_reg)$rank <- NA
+  V(g_reg)$rank[match(top_tbl$id, V(g_reg)$name)] <- top_tbl$rank
+
+  # plot con sfondo
+  p_map <- ggraph(g_reg, layout = "manual", x = V(g_reg)$lon, y = V(g_reg)$lat) +
+    geom_sf(data = reg_sf, fill = "gray95", color = "black", linewidth = 0.5, inherit.aes = FALSE) +
+    geom_sf(data = prov_sf, fill = NA, color = "gray30", linewidth = 0.5, inherit.aes = FALSE) +
+
+    geom_edge_link(alpha = 0.40, colour = "gray55", linewidth = 0.25) +
+    geom_node_point(aes(color = pr, size=pr), alpha = 0.95) +
+    
+    # numero sul nodo
+    geom_node_text(aes(label = rank, filter = !is.na(rank)),
+                   nudge_x = 0.05, nudge_y = 0.03, size = 3.2, fontface = "bold", color = "black") +
+    
+    scale_color_viridis_c(option = "plasma", name = "PageRank") +
+    guides(color = guide_colorbar(
+      barwidth  = grid::unit(0.25, "cm"),
+      barheight = grid::unit(2.2, "cm")
+      )) +
+    
+    theme(
+      legend.title = element_text(size = 11),
+      legend.text  = element_text(size = 9)
+      ) +
+    
+    scale_size_continuous(range = c(1, 1.5), guide = "none") +
+    coord_sf(
+      xlim = st_bbox(reg_sf)[c("xmin", "xmax")],
+      ylim = st_bbox(reg_sf)[c("ymin", "ymax")]
+    ) +
+    
+    theme_void() +
+    labs(
+      title = paste("Rete del pendolarismo lavorativo –", nome_reg),
+      subtitle = paste("Solo flussi interni, peso >", soglia)
+    )
+  
+  p_right <- plot_spacer() / p_tab / plot_spacer() +
+    plot_layout(heights = c(1, 2, 1))
+    p_map + p_right + plot_layout(widths = c(2.2, 1))
+}
+
+
+```
+
+
+```{r results='asis', echo=FALSE}
+
+plot_tutte_regioni <- function(soglia = 20, top_n = 5) {
+
+  regioni <- sort(unique(comuni$regione))
+  dir.create("plots_regioni", showWarnings = FALSE)
+
+  cat('<div class="region-grid">')
+
+  for (r in regioni) {
+    
+    filename_reg <- file.path("plots_regioni", paste0("plot_", gsub("[^A-Za-z0-9]", "_", r), ".png"))
+
+    ragg::agg_png(filename_reg, width = 1600, height = 1200, res = 220)
+    print(plot_graph_region_map(r, soglia = soglia, top_n = top_n))
+    dev.off()
+    
+    cat('<div class="region-card">')
+    cat(sprintf('<div class="region-title">%s</div>', regione_norm(r)))
+    cat(sprintf('<img src="%s" />', filename_reg))
+    cat('</div>')
+  }
+  
+  cat('</div>')
+  invisible(NULL)
+  
+}
+
+plot_tutte_regioni(soglia = 20, top_n = 5)
+
+```
+
+
+# 1. Quali sono gli hub della rete?
+
+## Aggregazione dei flussi di pendolarismo per comune
+
+A partire dalla matrice dei flussi origine-destinazione, sono state calcolate alcune variabili aggregate per ciascun comune:
+
+-    *pendolari_entrata*: numero totale di lavoratori provenienti da altri comuni.
+-    *pendolari_uscita*: numero totale di residenti che lavorano in un comune diverso da quello di residenza.
+-    *pendolari_interni*: flusso “interno” al comune (self-loop), cioè lavoratori che risiedono e lavorano nello stesso comune.
+-    *n_destinazioni*: numero di comuni distinti raggiunti dai residenti.
+-    *n_origini*: numero di comuni distinti di provenienza dei lavoratori.
+
+```{r aggregazione flussi, echo=FALSE}
+
+# Aggregazioni base sui flussi --------------------------
+
+# pendolari in uscita per comune
+out_flow <- spostamenti %>%
+  group_by(from) %>%
+  summarise(
+    pendolari_uscita = sum(num_pendolari),
+    n_destinazioni = n_distinct(to),
+    .groups = "drop"
+  )
+
+# pendolari in entrata per comune
+in_flow <- spostamenti %>%
+  group_by(to) %>%
+  summarise(
+    pendolari_entrata = sum(num_pendolari),
+    n_origini = n_distinct(from),
+    .groups = "drop"
+  )
+
+# self-loops
+self_loops <- spostamenti %>%
+  filter(from == to) %>%
+  group_by(from) %>%
+  summarise(
+    pendolari_interni = sum(num_pendolari),
+    .groups = "drop"
+  )
+
+```
+
+
+```{r top pendolari_entrata, echo=FALSE}
+
+# Tabella master "comuni_flow" -----------------------------
+
+comuni_flow <- comuni %>%
+  left_join(out_flow, by = c("id" = "from")) %>%
+  left_join(in_flow,  by = c("id" = "to")) %>%
+  left_join(self_loops, by = c("id" = "from")) %>%
+  mutate(
+    pendolari_uscita   = replace_na(pendolari_uscita, 0),
+    pendolari_entrata  = replace_na(pendolari_entrata, 0),
+    pendolari_interni  = replace_na(pendolari_interni, 0),
+    n_destinazioni     = replace_na(n_destinazioni, 0),
+    n_origini          = replace_na(n_origini, 0),
+
+    # sbilanciamento pendolare (attrattore vs residenziale)
+    log_ratio = log10((pendolari_entrata + 1) / (pendolari_uscita + 1)),
+
+    # attrattività normalizzata
+    attrattivita = pendolari_entrata / popolazione,
+    
+    saldo_pendolare = pendolari_entrata - pendolari_uscita
+  )
+
+# Tabella: Top 20 comuni per pendolari in entrata -------------------
+
+comuni_flow %>%
+  select(
+    id, nome, popolazione, pendolari_entrata, pendolari_uscita, 
+    pendolari_interni, saldo_pendolare, n_destinazioni, n_origini
+  ) %>%
+  arrange(desc(pendolari_entrata)) %>%
+  slice_head(n = 15) %>%
+  kable(
+    caption = "Top 15 comuni per pendolari in entrata (hub assoluti)",
+    format = "html",
+    align = "c"
+  ) %>%
+  kable_styling(
+    full_width = TRUE,
+    bootstrap_options = c("striped", "hover"),
+    font_size = 16
+  )
+
+```
+
+
+## Comuni Attrattori vs Residenziali
+
+Si vuole distinguere tra:
+
+-   i *comuni attrattori*, che ricevono molti pendolari (poli lavorativi);
+-   i *comuni residenziali*, che generano pendolarismo in uscita verso altri comuni;
+-   i *comuni bilanciati*, con entrate e uscite comparabili.
+
+Misura di sbilanciamento tra entrata e uscita:
+
+$$
+\small\log\_ratio = \log_{10}\left(\frac{pendolari\_entrata + 1}{pendolari\_uscita + 1}\right)
+$$
+
+```{r att vs res, echo = FALSE}
+
+# Top comuni attrattori (log_ratio più alto) -----------------------------
+
+comuni_flow %>%
+  select(
+    id, nome, regione,
+    pendolari_entrata, pendolari_uscita,
+    log_ratio
+  ) %>%
+  arrange(desc(log_ratio)) %>%
+  slice_head(n = 10) %>%
+  kable(
+    caption = "Top 10 comuni attrattori (log_ratio più alto)",
+    format = "html",
+    align = "c"
+  ) %>%
+  kable_styling(
+    full_width = TRUE,
+    bootstrap_options = c("striped", "hover"),
+    font_size = 20
+  )
+
+# Top comuni residenziali (log_ratio più basso) --------------------------
+
+comuni_flow %>%
+  select(
+    id, nome, regione,
+    pendolari_entrata, pendolari_uscita,
+    log_ratio
+  ) %>%
+  arrange(log_ratio) %>%
+  slice_head(n = 10) %>%
+  kable(
+    caption = "Top 10 comuni residenziali (log_ratio più basso)",
+    format = "html",
+    align = "c"
+  ) %>%
+  kable_styling(
+    full_width = TRUE,
+    bootstrap_options = c("striped", "hover"),
+    font_size = 20
+  )
+
+```
+
+## Distribuzione dello sbilanciamento pendolare 
+
+```{r log-ratio, echo=FALSE}
+
+# Distribuzione dello sbilanciamento pendolare --------------------
+
+q1 <- quantile(comuni_flow$log_ratio, probs = c(0.5, 0.9, 0.99), na.rm = TRUE)
+
+print(
+
+ggplot(comuni_flow, aes(x = log_ratio)) +
+  geom_histogram(bins = 50, fill = "#4C72B0", alpha = 0.8) +
+  geom_vline(xintercept = q1, linetype = "dashed", color = "red") +
+  labs(
+    title = "Distribuzione dello sbilanciamento pendolare",
+    subtitle = "Linee tratteggiate: 50°, 90° e 99° percentile",
+    x = "log10(pendolari_entrata / pendolari_uscita)",
+    y = "Numero di comuni"
+  )
+)
+
+```
+
+## Attrattività normalizzata
+
+Per capire se esistono comuni piccoli ma molto attrattivi, è stata calcolata un’ulteriore variabile normalizzata:
+
+$$
+\small
+attrattivita = \frac{pendolari\_entrata}{popolazione}
+$$
+
+<div class="zoom-wrap">
+```{r attrattività normalizzata, echo=FALSE}
+
+# 10 comuni più attrattivi (in entrata)
+top10_attr <- comuni_flow %>%
+  arrange(desc(pendolari_entrata)) %>%
+  slice_head(n = 10)
+
+print(
+ggplot(comuni_flow, aes(x = popolazione + 1, y = pendolari_entrata + 1, color = log_ratio)) +
+
+  geom_point(alpha = 0.15, size = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1, color = "black") +
+  geom_point(data = top10_attr, size = 2.2, alpha = 0.9) +
+  geom_text_repel(data = top10_attr, aes(label = nome), size = 3, max.overlaps = 20, color="black") +
+
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_viridis_c(option = "plasma", name = "log_ratio") +
+  labs(
+    title = "Popolazione vs pendolari in entrata (Italia, 2021)",
+    subtitle = "Scala log-log. I comuni evidenziati sono i principali poli attrattori.",
+    x = "Popolazione residente (log)",
+    y = "Pendolari in entrata (log)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    axis.title = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  )
+)
+
+```
+</div>
+
+```{r pop, echo=FALSE}
+
+hub_model <- lm(
+  log10(pendolari_entrata + 1) ~ log10(popolazione + 1),
+  data = comuni_flow
+)
+
+comuni_flow %>%
+  arrange(desc(attrattivita)) %>%
+  select(nome, regione, popolazione, pendolari_entrata, attrattivita) %>%
+  head(10) %>%
+  kable(
+    caption = "Comuni più attrattivi del previsto rispetto alla popolazione (top 15)",
+    format = "html",
+    align = "c"
+  ) %>%
+  kable_styling(
+    full_width = TRUE,
+    bootstrap_options = c("striped", "hover"),
+    font_size = 20
+  )
+
+```
+
+
+# 2. La rete è Centralizzata o Policentrica?
+
+## Dstribuzione di grado e strengh (in/out)
+
+```{r misure di rete, echo= FALSE}
+
+deg_in  <- degree(g, mode = "in")
+deg_out <- degree(g, mode = "out")
+
+str_in  <- strength(g, mode = "in", weights = E(g)$weight)
+str_out <- strength(g, mode = "out", weights = E(g)$weight)
+
+df_net <- data.frame(
+  id = V(g)$name,
+  deg_in = deg_in,
+  deg_out = deg_out,
+  str_in = str_in,
+  str_out = str_out
+)
+
+#summary(df_net$deg_in)
+#summary(df_net$str_in)
+
+d1 <- ggplot(df_net, aes(x = deg_in)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.8) +
+  scale_x_log10() +
+  labs(
+    title = "Distribuzione dell'in-degree (scala log)",
+    x = "in-degree (numero origini distinte)",
+    y = "Numero di comuni"
+  ) +
+  theme_minimal()
+
+d2 <- ggplot(df_net, aes(x = deg_out)) +
+  geom_histogram(bins = 50, fill = "darkorange", alpha = 0.8) +
+  scale_x_log10() +
+  labs(
+    title = "Distribuzione dell'out-degree (scala log)",
+    x = "out-degree (numero destinazioni distinte)",
+    y = "Numero di comuni"
+  ) +
+  theme_minimal()
+
+d1 + d2
+
+s1 <- ggplot(df_net, aes(x = str_in)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.8) +
+  scale_x_log10() +
+  labs(
+    title = "Distribuzione dell'in-strength (scala log)",
+    x = "in-strength (somma pesi entranti)",
+    y = "Numero di comuni"
+  ) +
+  theme_minimal()
+
+s2 <- ggplot(df_net, aes(x = str_out)) +
+  geom_histogram(bins = 50, fill = "darkorange", alpha = 0.8) +
+  scale_x_log10() +
+  labs(
+    title = "Distribuzione dell'out-strength (scala log)",
+    x = "out-strength (somma pesi uscenti)",
+    y = "Numero di comuni"
+  ) +
+  theme_minimal()
+
+s1 + s2
+
+```
+
+```{r lorenz, echo=FALSE}
+
+# mi chiedo quanto del totale è concentrato nel top p dei comuni
+
+df_net_sorted <- df_net %>%
+  arrange(desc(str_in))
+          
+# top comuni più attrattivi
+tot_in <- sum(df_net_sorted$str_in)
+
+# totale pendolari in entrata
+share_top <- function(p) {
+  k <- ceiling(nrow(df_net_sorted) * p)
+  sum(df_net_sorted$str_in[1:k]) / tot_in
+}
+
+# quota di pendolari che confluisce nell’1% dei comuni più attrattivi
+share_top_1  <- share_top(0.01)
+share_top_5  <- share_top(0.05)
+share_top_10 <- share_top(0.10)
+
+lorenz_curve <- function(x) {
+  x <- x[!is.na(x)]
+  x <- x[x >= 0]
+  x <- sort(x)  # dal più piccolo al più grande
+
+  n <- length(x)
+  cum_pop <- (1:n) / n         # percentrale dei comuni
+  cum_x <- cumsum(x) / sum(x)  # percentuale di pendolari
+
+  tibble(cum_pop = cum_pop, cum_x = cum_x)
+}
+
+lorenz_in <- lorenz_curve(df_net$str_in)
+
+points_df <- tibble(p = c(0.90, 0.95, 0.99)) %>%
+  mutate(
+    idx = ceiling(p * nrow(lorenz_in)),
+    x = lorenz_in$cum_pop[idx],
+    y = lorenz_in$cum_x[idx],
+    label = c("Bottom 90%", "Bottom 95%", "Bottom 99%")
+  )
+
+print(
+ggplot(lorenz_in, aes(x = cum_pop, y = cum_x)) +
+  geom_line(linewidth = 1.1, color="steelblue4") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "gray40", linewidth = 0.8) +
+  geom_point(data = points_df, aes(x = x, y = y), hjust = -0.1, vjust = -0.3, size = 2.5) +
+  geom_text(data = points_df, aes(x = x, y = y, label = label),
+            nudge_y = 0.03, size = 3) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Curva di Lorenz dell'in-strength",
+    subtitle = "Punti evidenziati: quote cumulate per le fasce inferiori di comuni",
+    x = "Quota cumulata di comuni",
+    y = "Quota cumulata di pendolari in entrata"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+)
+
+```
+
+
+## Confronto geografico per ripartizioni
+
+<div class="zoom-wrap">
+```{r ripartizioni, echo=FALSE}
+
+df_net_geo <- df_net %>%
+  mutate(id = as.integer(id)) %>%
+  left_join(comuni %>% select(id), by = "id")
+
+#summary(df_net_geo$str_in)
+
+df_net_geo2 <- df_net_geo %>%
+  mutate(id = as.integer(id)) %>%
+  left_join(comuni %>% select(id, ripartizione, regione), by = "id")  %>%
+  filter(str_in > 0)
+
+print(
+ggplot(df_net_geo2, aes(x = ripartizione, y = str_in)) +
+  geom_boxplot(outlier.alpha = 0.2, aes(fill = ripartizione)) +
+  geom_jitter(alpha = 0.1, width = 0.2, size = 0.4, color="gray40") + # evidenzia il numero di comuni
+  scale_y_log10() +
+  scale_fill_brewer(palette = "Pastel1") +
+  labs(
+    title = "Distribuzione dell'in-strength per ripartizione geografica",
+    x = "Ripartizione",
+    y = "Pendolari in entrata (scala log)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.position = "none"
+  )
+)
+```
+</div>
+
+
+# 3. Community Detection
+
+## Top Cluster e Grafo
+
+```{r cluster, echo=FALSE}
+
+# grafo non diretto
+g_und <- as.undirected(g, mode = "collapse", edge.attr.comb = "sum")
+# collapse unisce archi opposti
+
+cluster <- cluster_louvain(g_und, weights = E(g_und)$weight)
+
+# numero comunità totali
+num_cluster <- length(unique(membership(cluster)))
+
+# dimensioni cluster (ordinate)
+dim_cluster <- sort(sizes(cluster), decreasing = TRUE)
+
+# top 8 cluster
+top8 <- as.integer(names(dim_cluster[1:8]))
+
+df_nodes <- data.frame(
+  id      = as.integer(V(g_und)$name),
+  comune  = V(g_und)$nome,
+  regione = V(g_und)$regione,
+  lon = V(g_und)$lon,
+  lat = V(g_und)$lat,
+  cluster = membership(cluster)
+)
+
+#aggiungo i cluster agli archi (per colorazione)
+edges_geo_clust <- edges_filt %>%
+  left_join(df_nodes %>% select(id, cluster), by = c("from" = "id")) %>%
+  rename(cluster_from = cluster) %>%
+  left_join(df_nodes %>% select(id, cluster), by = c("to" = "id")) %>%
+  rename(cluster_to = cluster) %>%
+  mutate(
+    cluster_edge = ifelse(
+      cluster_from == cluster_to & cluster_from %in% top8,
+      as.factor(cluster_from),
+      NA
+    )
+  )
+
+df_top_cluster <- df_nodes %>%
+  mutate(cluster = ifelse(cluster %in% top8, cluster, NA)) %>%
+  filter(!is.na(cluster)) %>%
+  mutate(cluster = factor(cluster))
+
+tab_top8 <- data.frame(
+  cluster = names(dim_cluster[1:8]),
+  size = as.integer(dim_cluster[1:8])
+)
+
+kable(tab_top8, col.names = c("Cluster", "Dimensione"), align = "c") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"), font_size = 18) %>%
+  add_header_above(c("Top 8 cluster (Louvain)" = 2))
+
+cat("Numero cluster totali:", num_cluster, "\n")
+cat("Modularity:", round(modularity(cluster), 3), "\n")
+
+```
+
+<div class="zoom-wrap">
+```{r grafo cluster, fig.width=11, fig.height=13, echo=FALSE}
+
+print(
+ggplot() +
+  geom_sf(data = regioni_sf, fill = "gray95", color = "gray20", linewidth = 0.20) +
+  # tutti i nodi
+  geom_point(data = df_nodes, aes(x = lon, y = lat), color = "black", 
+             size = 0.3, alpha = 0.5) +
+  # nodi appartenenti ai cluster
+  geom_point(
+    data = df_top_cluster %>% filter(!is.na(cluster)),
+    aes(x = lon, y = lat, color = as.factor(cluster)),
+    size = 0.4,
+    alpha = 0.8
+  ) +
+  coord_sf() + # imposta sistema corretto per mappe sf
+  theme_void() +
+  labs(
+    color = "Comunità",
+    title = "Comunità territoriali del pendolarismo lavorativo (Louvain)",
+    subtitle = paste(
+      "Comunità =", length(unique(df_top_cluster$cluster)),
+      "| modularità =", round(modularity(cluster), 3)
+    )
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(size = 5, alpha = 1)
+    )
+  )
+)
+
+```
+</div>
+
+```{r cluster algorithms, echo = FALSE}
+
+algorithms <- list(
+  Louvain = cluster_louvain(g_und, weights = E(g_und)$weight),
+  FastGreedy = cluster_fast_greedy(g_und, weights = E(g_und)$weight),
+  LabelPropagation = cluster_label_prop(g_und, weights = E(g_und)$weight),
+  Walktrap = cluster_walktrap(g_und, weights = E(g_und)$weight)
+)
+
+
+modularity_scores <- sapply(algorithms, modularity)
+
+results <- data.frame(
+  Algorithm = names(modularity_scores),
+  Modularity = modularity_scores
+)
+
+```
+
+```{r cluster algorithms barplot, echo = FALSE}
+
+names <- c("Louvain", "FastGreedy", "LabelProp", "Walktrap")
+
+bp <- barplot(results$Modularity, names.arg = names, col = "lightpink",
+        main = "Confronto della modularità tra diversi algoritmi",
+        ylab = "Modularità", ylim = c(0, max(results$Modularity) + 0.1))
+
+text(x = bp, y = results$Modularity,
+     labels = round(results$Modularity, 3), pos = 3, cex = 0.9
+     )
+
+```
+
+
+## Cluster "trans-regionali"
+
+```{r cluster regioni, echo=FALSE}
+
+cluster_summary <- df_nodes %>%
+  filter(!is.na(cluster)) %>%
+  group_by(cluster) %>%
+  summarise(
+    n_comuni = n(), # numero di comune per cluster
+    n_regioni = n_distinct(regione), # numero di regioni diverse per cluster
+    regioni_coinvolte = paste(sort(unique(regione)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_regioni), desc(n_comuni))
+
+cluster_summary %>%
+  filter(n_regioni >= 2) %>%
+  head(10) %>%
+  kable(
+    caption = "Cluster che attraversano più regioni",
+    format = "html",
+    align = "c"
+  ) %>%
+  kable_styling(
+    full_width = TRUE,
+    bootstrap_options = c("striped", "hover"),
+    font_size = 20
+  )
+
+
+```
+
+
+# 4. Quanto conta la distanza geografica?
+
+## Classi di distanze
+
+-   La maggior parte dei flussi è local.
+-   I flussi lunghi esistono ma sono rari.
+
+<div class="zoom-wrap">
+```{r geografia, echo=FALSE}
+
+# calcolo distanza geodesica in km
+
+p_from <- st_as_sf(edges_geo, coords = c("lon_from", "lat_from"), crs = 4326)
+p_to   <- st_as_sf(edges_geo, coords = c("lon_to", "lat_to"), crs = 4326)
+
+dist_m <- st_distance(st_geometry(p_from), st_geometry(p_to), by_element = TRUE)
+edges_geo <- edges_geo %>%
+  mutate(
+    dist_km = as.numeric(dist_m) / 1000
+  ) %>%
+  filter(!is.na(dist_km), dist_km > 0)
+
+
+q_dis <- quantile(edges_geo$dist_km, probs = c(0.5, 0.75, 0.9, 0.95, 0.99), na.rm = TRUE)
+
+# mediana (50%) → “metà dei flussi avviene entro 24.78 km”
+# 90% → “quasi tutti i flussi entro 110.147 km”
+# 99% → “lunghe distanze rare ma presenti”
+
+print (
+  
+edges_geo %>%
+  mutate(dist_bin = cut(
+    dist_km,
+    breaks = c(0, 5, 10, 20, 50, 100, 200, 500, Inf),
+    right = FALSE
+  )) %>%
+  ggplot(aes(x = dist_bin, y = num_pendolari + 1)) +
+  geom_boxplot(outlier.alpha = 0.1, fill = "lightgreen") +
+  scale_y_log10() +
+  # scale_fill_viridis_d(option = "plasma", guide = "none") +
+  labs(
+    title = "Distribuzione dei flussi per classe di distanza",
+    subtitle = "Boxplot (y in scala log): flussi più deboli alle distanze maggiori",
+    x = "Classe di distanza (km)",
+    y = "Numero pendolari (log)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.minor = element_blank())
+)
+```
+</div>
+
+## Flussi più lunghi
+
+```{r flussi più lunghi, echo=FALSE}
+# flussi lunghi "forti"
+# distanza alta, peso alto
+edges_geo %>%
+  filter(dist_km > 1000) %>%
+  arrange(desc(dist_km)) %>%
+  select(nome_from, regione_from, nome_to, regione_to, num_pendolari, dist_km) %>%
+  kable(
+    caption = "I flussi di pendolarismo più lunghi (> 1000 km)",
+    format = "html",
+    align = "c"
+  ) %>%
+  kable_styling(
+    full_width = TRUE,
+    bootstrap_options = c("striped", "hover"),
+    font_size = 20
+  )
+
+```
+
+
+# 5. I comuni più centrali lo sono anche economicamente? 
+
+## Reddito medio
+
+A partire dai dati MEF viene calcolato il reddito medio da lavoro dipendente e totale:
+
+$$
+\small
+reddito\_medio\_lav = \frac{reddito\_lav}{num\_contribuenti}
+$$
+$$
+\small
+reddito\_medio\_tot = \frac{reddito\_tot}{num\_contribuenti}
+$$
+
+-   Relazione positiva tra reddito medio da lavoro e pendolari in entrata.
+-   I comuni economicamente più forti tendono ad attrarre un numero maggiore di lavoratori.
+
+<div class="zoom-wrap">
+```{r reddito, fig.height = 6, fig.width = 9, echo=FALSE}
+
+comuni_reddito <- comuni %>%
+  left_join(reddito, by = c("id" = "id_comune")) %>%
+  mutate(
+    reddito_medio_lav = reddito_lav / num_contribuenti,
+    reddito_medio_tot = reddito_tot / num_contribuenti
+  ) %>%
+  filter(!is.na(reddito_medio_lav), reddito_medio_lav > 0)
+
+pr <- page_rank(g, directed = TRUE, weights = E(g)$weight)$vector
+
+df_net <- df_net %>%
+  mutate(
+    id = as.integer(V(g)$name),
+    pagerank=pr
+  )
+
+df_all <- df_net %>%
+  left_join(comuni_reddito, by = "id") %>%
+  filter(!is.na(reddito_medio_lav))
+
+
+top10_pr <- df_all %>% arrange(desc(pagerank)) %>% slice_head(n = 10)
+
+print (
+ggplot(df_all, aes(x = reddito_medio_lav, y = str_in + 1)) +
+  geom_point(alpha = 0.18, size = 0.7, color = "gray30") +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8, color = "black") +
+  geom_point(data = top10_pr, size = 2.2, color = "red") +
+  geom_text_repel(data = top10_pr, aes(label = nome), size = 3, max.overlaps = 20) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    title = "Relazione tra struttura della rete e variabili economiche",
+    subtitle = "I comuni in rosso sono i top 10 per PageRank nella rete",
+    x = "Reddito medio da lavoro (log)",
+    y = "In-strength: pendolari in entrata (log)"
+  ) +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank())
+)
+
+```
+</div>
+
+## Hub di rete vs hub economici
+
+-   Emergono quattro profili distinti di comuni.
+-   Non tutti i comuni ricchi sono centrali nella rete, e non tutti gli hub sono economicamente forti.
+
+<div class="zoom-wrap">
+```{r grafio standardizzato reddito, echo=FALSE, fig.height=9, fig.width=8}
+
+df_all_stand <- df_all %>%
+  mutate(
+    z_pr = as.numeric(scale(pagerank)), # pagerank standardizzato (z-score)
+    z_red = as.numeric(scale(reddito_medio_lav)), # reddito medio standardizzato (z-score)
+    categoria = case_when(
+      # reddito alto + pr alto
+      z_pr >= 0 & z_red >= 0 ~ "Hub economico + rete",
+      # reddito basso + pr alto
+      z_pr >= 0 & z_red <  0 ~ "Hub di rete (basso reddito)",
+      # reddito alto + pr basso
+      z_pr <  0 & z_red >= 0 ~ "Ricco ma periferico",
+      # reddito basso + pr basso
+      TRUE                  ~ "Intermedio"
+    )
+  )
+
+
+top_label <- df_all_stand %>%
+  mutate(score = sqrt(z_pr^2 + z_red^2)) %>%
+  arrange(desc(score)) %>%
+  slice_head(n = 12)
+
+print (
+  
+ggplot(df_all_stand, aes(x = z_red, y = z_pr, color = categoria)) +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = 0, ymax = Inf, alpha = 0.06) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = 0, ymax = Inf, alpha = 0.06) +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = 0, alpha = 0.06) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = -Inf, ymax = 0, alpha = 0.06) +
+
+  geom_point(alpha = 0.55, size = 1.8) +
+
+  # Linee medie (z = 0)
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5, color = "gray35") +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5, color = "gray35") +
+
+  # Etichette
+  geom_text_repel(
+    data = top_label,
+    aes(label = nome),
+    size = 3.2,
+    max.overlaps = 20,
+    box.padding = 0.4
+  ) +
+
+  labs(
+    title = "Comuni: Reddito medio vs Centralità nella rete",
+    subtitle = "Valori standardizzati (z-score): 0 = media nazionale",
+    x = "Reddito medio (z-score)",
+    y = "Centralità (PageRank, z-score)",
+    color = "Categoria"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+)
+
+```
+</div>
+
+```{r ultima tabella, echo=FALSE}
+
+# ricchi ma periferici
+df_all %>%
+  arrange(desc(reddito_medio_lav)) %>%
+  select(nome, regione, reddito_medio_lav, pagerank, str_in) %>%
+  head(8) %>%
+  kable(
+    caption = "Top 8 comuni per reddito medio",
+    format = "html",
+    align = "c"
+  ) %>%
+  kable_styling(
+    full_width = TRUE,
+    bootstrap_options = c("striped", "hover"),
+    font_size = 20
+  )
+
+```
+
+
+# Conclusioni
+
+- Il pendolarismo tra comuni italiani può essere modellato in modo efficace come rete direzionata e pesata.
+- La rete mostra una forte concentrazione: pochi comuni attraggono la maggior parte dei flussi.
+- le misure di centralità evidenziano una disuguaglianza nell'attrattività lavorativa.
+- Le comunità individuate non coincidono del tutto con i confini regionali.
+- Esiste una relazione positiva tra reddito medio e attrattività lavorativa.
